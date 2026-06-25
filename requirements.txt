@@ -1,0 +1,2 @@
+# RunMux ComfyUI nodes depend on the official RunMux Python SDK (which pulls in httpx).
+runmux>=0.1.0
