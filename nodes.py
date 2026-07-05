@@ -44,9 +44,16 @@ except ImportError as exc:  # pragma: no cover - exercised only without the SDK
 # default; a free-text "model" string node could be added later if needed.
 _MODELS = ["seedance-2-0-mini", "seedance-2-0", "seedance-2-0-fast"]
 _RESOLUTIONS = ["480p", "720p", "1080p"]
+_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]
 
 # Up to 9 reference images — the Seedance 2.0 upstream cap.
 _MAX_REFERENCE_IMAGES = 9
+_MAX_REFERENCE_AUDIOS = 3
+_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
+_AUDIO_MIME_BY_EXT = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
 
 # Reference images are re-encoded as JPEG data: URIs before upload. Nine raw
 # PNGs would blow past the API's request-body limit; JPEG q90 with the long
@@ -103,6 +110,124 @@ def _parse_reference_assets(text: str) -> List[str]:
         if item:
             out.append(item)
     return out
+
+
+def _comfy_audio_roots() -> List[str]:
+    """Return local directories that are safe to read audio references from."""
+    roots: List[str] = []
+    env_roots = os.environ.get("RUNMUX_COMFY_AUDIO_ROOTS", "")
+    for part in env_roots.replace(",", os.pathsep).split(os.pathsep):
+        item = part.strip()
+        if item:
+            roots.append(item)
+
+    try:
+        import folder_paths  # type: ignore
+
+        for getter_name in ("get_input_directory", "get_temp_directory"):
+            getter = getattr(folder_paths, getter_name, None)
+            if callable(getter):
+                try:
+                    roots.append(getter())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    out: List[str] = []
+    seen = set()
+    for root in roots:
+        real = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+        if os.path.isdir(real) and real not in seen:
+            seen.add(real)
+            out.append(real)
+    return out
+
+
+def _resolve_audio_path(value: str) -> str:
+    roots = _comfy_audio_roots()
+    if not roots:
+        raise RuntimeError(
+            "本地参考音频只能从 ComfyUI 的 input/temp 目录读取。当前环境无法定位这些目录;"
+            "请把音频放入 ComfyUI input 目录,或传入 https:// / asset:// / data:audio 引用。"
+        )
+
+    candidates = [value] if os.path.isabs(value) else [os.path.join(root, value) for root in roots]
+    for candidate in candidates:
+        real = os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+        for root in roots:
+            try:
+                inside_root = os.path.commonpath([root, real]) == root
+            except ValueError:
+                inside_root = False
+            if inside_root and os.path.isfile(real):
+                return real
+
+    raise RuntimeError(
+        "参考音频文件必须位于 ComfyUI input/temp 目录,且不能包含路径穿越。"
+        f"找不到或不允许读取: {value}"
+    )
+
+
+def _audio_reference_to_uri(value: str) -> str:
+    item = (value or "").strip()
+    if not item:
+        return ""
+    lowered = item.lower()
+    if lowered.startswith(("https://", "asset://", "data:audio/")):
+        return item
+    if lowered.startswith("http://"):
+        raise RuntimeError("参考音频 URL 必须使用 https://,或使用 asset:// / data:audio。")
+
+    path = _resolve_audio_path(item)
+    ext = os.path.splitext(path)[1].lower()
+    mime = _AUDIO_MIME_BY_EXT.get(ext)
+    if not mime:
+        allowed = ", ".join(sorted(_AUDIO_MIME_BY_EXT))
+        raise RuntimeError(f"参考音频仅支持 {allowed} 文件: {item}")
+    size = os.path.getsize(path)
+    if size > _MAX_REFERENCE_AUDIO_BYTES:
+        raise RuntimeError("参考音频最大 15MB,请压缩或裁剪后再试。")
+
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+
+
+def _audio_to_wav_data_uri(audio: Any) -> str:
+    """Encode a ComfyUI AUDIO object as a WAV data URI."""
+    if not isinstance(audio, dict):
+        raise RuntimeError("参考音频输入必须是 ComfyUI AUDIO 对象。")
+    waveform = audio.get("waveform")
+    sample_rate = audio.get("sample_rate")
+    if waveform is None or not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise RuntimeError("参考音频缺少 waveform 或 sample_rate。")
+
+    import numpy as np
+    import wave
+
+    data = waveform.detach().cpu().numpy() if hasattr(waveform, "detach") else waveform
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim == 2 and arr.shape[0] > arr.shape[1] and arr.shape[1] <= 8:
+        arr = arr.T
+    if arr.ndim != 2:
+        raise RuntimeError(f"参考音频 waveform 形状不支持: {arr.shape!r}")
+
+    pcm = (np.clip(arr, -1.0, 1.0).T * 32767.0).round().astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(int(arr.shape[0]))
+        wav.setsampwidth(2)
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(pcm.tobytes())
+    raw = buf.getvalue()
+    if len(raw) > _MAX_REFERENCE_AUDIO_BYTES:
+        raise RuntimeError("参考音频最大 15MB,请压缩或裁剪后再试。")
+    return "data:audio/wav;base64," + base64.b64encode(raw).decode("ascii")
 
 
 def _result_url(result: Any) -> str:
@@ -253,12 +378,20 @@ class RunMuxGenerateVideo:
         }
         for i in range(1, _MAX_REFERENCE_IMAGES + 1):
             optional[f"image_{i}"] = ("IMAGE",)
+        for i in range(1, _MAX_REFERENCE_AUDIOS + 1):
+            optional[f"reference_audio_{i}"] = ("STRING", {
+                "default": "",
+                "multiline": False,
+                "tooltip": "https:// / asset:// / data:audio 引用,或 ComfyUI input/temp 目录中的 .wav/.mp3 文件。",
+            })
+            optional[f"audio_{i}"] = ("AUDIO",)
         return {
             "required": {
                 "api_key": ("STRING", {"default": "", "multiline": False}),
                 "model": ("STRING", {"default": "seedance-2-0-mini"}),
                 "prompt": ("STRING", {"default": "", "multiline": True}),
                 "resolution": (_RESOLUTIONS, {"default": "480p"}),
+                "ratio": (_RATIOS, {"default": "16:9"}),
                 "duration": ("INT", {"default": 5, "min": 1, "max": 60, "step": 1}),
                 "auto_enroll_faces": ("BOOLEAN", {"default": False}),
             },
@@ -276,6 +409,7 @@ class RunMuxGenerateVideo:
         model: str,
         prompt: str,
         resolution: str,
+        ratio: str,
         duration: int,
         auto_enroll_faces: bool,
         reference_assets: str = "",
@@ -283,6 +417,9 @@ class RunMuxGenerateVideo:
         download: bool = True,
         first_frame: Optional[Any] = None,
         last_frame: Optional[Any] = None,
+        reference_audio_1: str = "",
+        reference_audio_2: str = "",
+        reference_audio_3: str = "",
         **image_inputs: Any,
     ) -> Tuple[str, str]:
         api_key = (api_key or "").strip() or os.environ.get("RUNMUX_API_KEY", "")
@@ -298,6 +435,7 @@ class RunMuxGenerateVideo:
             "model": (model or "seedance-2-0-mini").strip(),
             "prompt": prompt,
             "resolution": resolution,
+            "ratio": ratio,
             "duration": int(duration),
             "auto_enroll_faces": bool(auto_enroll_faces),
         }
@@ -319,9 +457,24 @@ class RunMuxGenerateVideo:
         if last_frame is not None:
             frame_images.append({"url": _tensor_to_data_uri(last_frame), "frame": "last"})
 
-        if frame_images and (references or image_url):
+        audio_refs = [
+            ref for ref in (
+                _audio_reference_to_uri(reference_audio_1),
+                _audio_reference_to_uri(reference_audio_2),
+                _audio_reference_to_uri(reference_audio_3),
+            )
+            if ref
+        ]
+        for i in range(1, _MAX_REFERENCE_AUDIOS + 1):
+            audio = image_inputs.get(f"audio_{i}")
+            if audio is not None:
+                audio_refs.append(_audio_to_wav_data_uri(audio))
+        if len(audio_refs) > _MAX_REFERENCE_AUDIOS:
+            raise RuntimeError(f"参考音频最多 {_MAX_REFERENCE_AUDIOS} 段。")
+
+        if frame_images and (references or image_url or audio_refs):
             raise RuntimeError(
-                "首帧/尾帧(frame 控制)与参考图(image_1..9 / reference_assets / image_url)不能同时使用 — "
+                "首帧/尾帧(frame 控制)与参考图/参考音频(image_1..9 / reference_assets / image_url / reference_audio)不能同时使用 — "
                 "上游模型二选一。要在多参考图模式下指定首帧,请把首帧图接到某个 image_N,"
                 "并在提示词里写「以图N为首帧 / use Image N as the start frame」。"
             )
@@ -337,11 +490,14 @@ class RunMuxGenerateVideo:
                         f"参考图最多 {_MAX_REFERENCE_IMAGES} 张(image_1..9 与 reference_assets、image_url 合计),"
                         f"当前 {len(references)} 张。"
                     )
-                kwargs["reference_images"] = references
+                kwargs["images"] = references
             else:
                 # Legacy single-image path: a lone image_url keeps its historical
                 # first-frame-ish semantics upstream — do not silently change it.
                 kwargs["image_url"] = image_url
+
+        if audio_refs:
+            kwargs["reference_audios"] = audio_refs
 
         try:
             with runmux.RunmuxClient(api_key=api_key) as client:

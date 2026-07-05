@@ -12,8 +12,10 @@ optionally, the mp4 saved into ComfyUI's output folder).
   **9 reference images**: wire ComfyUI "Load Image" nodes straight into
   `image_1..image_9`, and/or paste `asset://…` ids / image URLs into
   `reference_assets` (one per line; commas work too). `first_frame` /
-  `last_frame` inputs give exact frame control. Outputs the video URL and,
-  when downloading is enabled, the path to the saved mp4.
+  `last_frame` inputs give exact frame control. Choose `ratio` explicitly for
+  portrait, square, or landscape output, and attach up to 3 reference-audio
+  inputs through `audio_1..3` or `reference_audio_1..3`. Outputs the video URL
+  and, when downloading is enabled, the path to the saved mp4.
 - **RunMux Save Video** — download the finished video into ComfyUI's output
   folder and decode it into an IMAGE frame batch (for preview, upscaling,
   interpolation, or chaining the last frame into the next shot).
@@ -65,8 +67,11 @@ into the node's `api_key` field. Your key is your identity — don't share it.
 | `image_1..image_9` *(optional)* | Reference images, wired straight from "Load Image" nodes. Sent in slot order. |
 | `reference_assets` *(optional)* | `asset://…` ids and/or public image URLs — one per line (commas ok). Merged after the wired images; 9 total max. |
 | `image_url` *(optional)* | Legacy single-image field. Alone it keeps the old first-frame behavior; combined with references it becomes one more reference. |
-| `first_frame` / `last_frame` *(optional)* | Exact start/end frame control. **Mutually exclusive with reference images** (upstream rule) — in reference mode, say "以图1为首帧 / use Image 1 as the start frame" in the prompt instead. |
+| `audio_1..audio_3` *(optional)* | Native ComfyUI AUDIO inputs. Encoded as WAV data URIs and uploaded by RunMux. |
+| `reference_audio_1..reference_audio_3` *(optional)* | Reference audio as `https://`, `asset://`, `data:audio`, or a `.wav`/`.mp3` file under ComfyUI's input/temp folder. Local files are encoded inline and uploaded by RunMux. |
+| `first_frame` / `last_frame` *(optional)* | Exact start/end frame control. **Mutually exclusive with reference images/audio** (upstream rule) — in reference mode, say "以图1为首帧 / use Image 1 as the start frame" in the prompt instead. |
 | `resolution` | `480p` / `720p` / `1080p` (model-dependent). |
+| `ratio` | `16:9` / `9:16` / `1:1` / `4:3` / `3:4` / `21:9`. Use this field for portrait output; prompt text alone does not control orientation. |
 | `duration` | Seconds. |
 | `auto_enroll_faces` *(optional)* | If on, raw face photos among the references are enrolled automatically before generation. |
 | `download` *(optional)* | If on, the mp4 is saved into ComfyUI's `output/` folder. |
@@ -77,6 +82,15 @@ get a finished URL — no manual waiting/looping. Outputs: **video_url** and
 
 Wired images are auto-encoded (JPEG, long side capped at 2048px) and uploaded
 inline — you don't need to host them anywhere.
+
+Multi-reference images are sent with the official Seedance-style `images` field
+and normalized by RunMux to `reference_images` internally. A lone `image_url`
+still keeps the legacy single-image behavior.
+
+For reference audio, wire ComfyUI AUDIO directly when you have an audio node, or
+use a short `.wav`/`.mp3` in ComfyUI's input folder. Existing `https://` /
+`asset://` references also work. Local paths outside ComfyUI-managed media
+folders are rejected before the API call.
 
 ### RunMux Save Video
 

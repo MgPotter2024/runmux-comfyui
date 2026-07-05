@@ -89,6 +89,7 @@ def _generate(sink_dict, **overrides):
         model="seedance-2-0-mini",
         prompt="a test prompt",
         resolution="480p",
+        ratio="16:9",
         duration=5,
         auto_enroll_faces=False,
         download=False,
@@ -100,12 +101,17 @@ def _generate(sink_dict, **overrides):
 # ---------- structure ----------
 
 def test_input_types_have_new_fields():
+    req = nodes.RunMuxGenerateVideo.INPUT_TYPES()["required"]
     opt = nodes.RunMuxGenerateVideo.INPUT_TYPES()["optional"]
+    assert "ratio" in req
     for i in range(1, 10):
         assert f"image_{i}" in opt and opt[f"image_{i}"][0] == "IMAGE"
     assert "reference_assets" in opt
     assert "first_frame" in opt and opt["first_frame"][0] == "IMAGE"
     assert "last_frame" in opt and opt["last_frame"][0] == "IMAGE"
+    for i in range(1, 4):
+        assert f"reference_audio_{i}" in opt
+        assert f"audio_{i}" in opt and opt[f"audio_{i}"][0] == "AUDIO"
 
 
 def test_save_video_registered():
@@ -153,31 +159,88 @@ def test_multi_reference_merge_order(sink):
         image_3=_fake_image(),
         reference_assets="asset://lib1\nasset://lib2",
     )
-    refs = sink["kwargs"]["reference_images"]
+    refs = sink["kwargs"]["images"]
     assert len(refs) == 4
     assert refs[0].startswith("data:image/jpeg;base64,")
     assert refs[1].startswith("data:image/jpeg;base64,")
     assert refs[2] == "asset://lib1" and refs[3] == "asset://lib2"
     assert "image_url" not in sink["kwargs"]
     assert "frame_images" not in sink["kwargs"]
+    assert "reference_images" not in sink["kwargs"]
 
 
 def test_image_url_merges_into_references_when_refs_present(sink):
     _generate(sink, reference_assets="asset://a", image_url="https://cdn.example/b.jpg")
-    assert sink["kwargs"]["reference_images"] == ["asset://a", "https://cdn.example/b.jpg"]
+    assert sink["kwargs"]["images"] == ["asset://a", "https://cdn.example/b.jpg"]
 
 
 def test_legacy_single_image_url_stays_single(sink):
     _generate(sink, image_url="asset://only-one")
     assert sink["kwargs"]["image_url"] == "asset://only-one"
     assert "reference_images" not in sink["kwargs"]
+    assert "images" not in sink["kwargs"]
 
 
 def test_text_to_video_without_any_image(sink):
     _generate(sink)
     assert "reference_images" not in sink["kwargs"]
+    assert "images" not in sink["kwargs"]
     assert "image_url" not in sink["kwargs"]
     assert "frame_images" not in sink["kwargs"]
+
+
+def test_ratio_passed_to_sdk(sink):
+    _generate(sink, ratio="9:16")
+    assert sink["kwargs"]["ratio"] == "9:16"
+
+
+def test_reference_audio_urls_passed_to_sdk(sink):
+    _generate(
+        sink,
+        reference_audio_1="https://cdn.example/a.wav",
+        reference_audio_3="https://cdn.example/b.mp3",
+    )
+    assert sink["kwargs"]["reference_audios"] == [
+        "https://cdn.example/a.wav",
+        "https://cdn.example/b.mp3",
+    ]
+
+
+def test_reference_audio_local_file_encoded_from_allowed_root(sink, tmp_path, monkeypatch):
+    raw = b"RIFF\x24\x00\x00\x00WAVEfmt "
+    (tmp_path / "clip.wav").write_bytes(raw)
+    monkeypatch.setattr(nodes, "_comfy_audio_roots", lambda: [str(tmp_path)])
+
+    _generate(sink, reference_audio_1="clip.wav")
+
+    ref = sink["kwargs"]["reference_audios"][0]
+    assert ref.startswith("data:audio/wav;base64,")
+    assert base64.b64decode(ref.split(",", 1)[1]) == raw
+
+
+def test_reference_audio_native_audio_encoded_to_wav(sink):
+    _generate(
+        sink,
+        audio_1={
+            "waveform": np.zeros((1, 1, 16), dtype=np.float32),
+            "sample_rate": 16000,
+        },
+    )
+    ref = sink["kwargs"]["reference_audios"][0]
+    assert ref.startswith("data:audio/wav;base64,")
+    assert base64.b64decode(ref.split(",", 1)[1]).startswith(b"RIFF")
+
+
+def test_reference_audio_rejects_path_outside_allowed_root(sink, tmp_path, monkeypatch):
+    root = tmp_path / "input"
+    root.mkdir()
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"RIFF")
+    monkeypatch.setattr(nodes, "_comfy_audio_roots", lambda: [str(root)])
+
+    with pytest.raises(RuntimeError, match="input/temp"):
+        _generate(sink, reference_audio_1=str(outside))
+    assert "kwargs" not in sink
 
 
 def test_more_than_nine_references_rejected(sink):
@@ -194,6 +257,7 @@ def test_first_and_last_frame_mode(sink):
     assert [f["frame"] for f in frames] == ["first", "last"]
     assert all(f["url"].startswith("data:image/jpeg;base64,") for f in frames)
     assert "reference_images" not in sink["kwargs"]
+    assert "images" not in sink["kwargs"]
 
 
 def test_frame_mode_conflicts_with_references(sink):
